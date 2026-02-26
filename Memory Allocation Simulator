@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Memory Allocation Simulator</title>
+<style>
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background: #fce7f3; /* soft pastel pink background */
+    margin: 0; padding: 0;
+}
+.container {
+    max-width: 1200px;
+    margin: 30px auto;
+    background: #fff0f5; /* light lavender/purple container */
+    padding: 30px 35px;
+    border-radius: 20px;
+    box-shadow: 0 15px 35px rgba(0,0,0,0.1);
+}
+h1 { text-align: center; color: #6a0dad; margin-bottom: 25px; font-size: 2rem; }
+.form-section {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 15px;
+    margin-bottom: 25px;
+}
+.form-section label { font-weight: bold; color: #4b0082; }
+.form-section input, .form-section select { padding: 8px 12px; border-radius: 10px; border: 1px solid #ccc; font-size: 1rem; }
+button {
+    background-color: #ffb6c1; color: #4b0082; border: none;
+    padding: 10px 20px; border-radius: 12px; font-weight: bold; cursor: pointer;
+    transition: background 0.3s, color 0.3s;
+}
+button:hover { background-color: #dda0dd; color: #fff; }
+
+#blocks {
+    display: flex; flex-wrap: wrap; gap: 15px; justify-content: center; margin: 20px 0;
+}
+.memory-block {
+    border: 2px solid #a974b7; border-radius: 18px;
+    width: 180px; min-height: 180px; position: relative;
+    display: flex; flex-direction: column; align-items: center;
+    background-color: #ffe6f0;
+    overflow: hidden;
+    transition: height 0.5s, background-color 0.5s;
+    box-shadow: 2px 5px 12px rgba(0,0,0,0.08);
+}
+.block-title { 
+    font-weight: bold; color: #4b0082; margin-top: 5px; text-align:center;
+    font-size: 1.1rem;
+}
+
+.process-segment {
+    width: 90%; margin: 2px 0;
+    color: white; font-weight: bold; text-align: center;
+    border-radius: 6px;
+    transition: height 0.5s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.9rem;
+}
+
+.frag-report {
+    margin-top: 20px;
+    padding: 20px;
+    background: #ffe6f2;
+    border-radius: 15px;
+    color: #6a0dad;
+    font-weight: bold;
+    text-align: center;
+    font-size: 1rem;
+}
+
+/* Pastel colors (pink & purple palette) */
+.pastel-colors = ["#f8c1dc","#f5a9e1","#e1a0f7","#d1b3ff","#c7b0ff","#f7c6f7","#ffc1e3","#ffb6c1"];
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Memory Allocation Simulator</h1>
+
+<div class="form-section">
+    <label>Blocks:</label><input type="number" id="numBlocks" value="5">
+    <label>Processes:</label><input type="number" id="numProcesses" value="3">
+    <label>Method:</label>
+    <select id="method">
+        <option value="first">First Fit</option>
+        <option value="best">Best Fit</option>
+        <option value="worst">Worst Fit</option>
+    </select>
+    <button onclick="setupMemory()">Setup & Allocate</button>
+</div>
+
+<div id="blocks"></div>
+<div class="frag-report" id="fragReport">Fragmentation Report will appear here</div>
+</div>
+
+<script>
+let blockSizes=[], blockOccupied=[], internalFrag=[], allocation=[], processSizes=[];
+
+const colors=["#f8c1dc","#f5a9e1","#e1a0f7","#d1b3ff","#c7b0ff","#f7c6f7","#ffc1e3","#ffb6c1"];
+
+function setupMemory(){
+    const numBlocks=parseInt(document.getElementById('numBlocks').value);
+    const numProcesses=parseInt(document.getElementById('numProcesses').value);
+    const method=document.getElementById('method').value;
+
+    blockSizes=Array(numBlocks).fill(0);
+    blockOccupied=Array(numBlocks).fill(false);
+    internalFrag=Array(numBlocks).fill(0);
+    allocation=Array(numProcesses).fill(-1);
+    processSizes=Array(numProcesses).fill(0);
+
+    const blocksDiv=document.getElementById('blocks');
+    blocksDiv.innerHTML='';
+
+    for(let i=0;i<numBlocks;i++){
+        let size=parseInt(prompt(`Enter size of Block ${i+1}:`,"100"));
+        blockSizes[i]=size;
+        let div=document.createElement('div'); div.className='memory-block'; div.id='block'+i;
+        div.innerHTML=`<div class="block-title">B${i+1}<br>${size} KB</div>`;
+        blocksDiv.appendChild(div);
+    }
+
+    for(let i=0;i<numProcesses;i++){
+        let size=parseInt(prompt(`Enter size of Process P${i+1}:`,"50"));
+        processSizes[i]=size;
+    }
+
+    animateAllocation(method);
+}
+
+async function animateAllocation(method){
+    for(let i=0;i<processSizes.length;i++){
+        await new Promise(res => setTimeout(res, 500)); 
+        let index=findBlock(method, processSizes[i]);
+        if(index!=-1){
+            allocation[i]=index;
+            blockOccupied[index]=true;
+            internalFrag[index]=blockSizes[index]-processSizes[i];
+            drawProcess(i,index);
+        } else {
+            compactMemory();
+            index=findBlock(method, processSizes[i]);
+            if(index!=-1){
+                allocation[i]=index;
+                blockOccupied[index]=true;
+                internalFrag[index]=blockSizes[index]-processSizes[i];
+                drawProcess(i,index);
+            }
+        }
+        updateFragmentation();
+    }
+
+    await new Promise(res => setTimeout(res, 500));
+    await animateMergedAllocation();
+}
+
+function drawProcess(processIndex, blockIndex){
+    const blockDiv=document.getElementById('block'+blockIndex);
+    const seg=document.createElement('div');
+    seg.className='process-segment';
+    seg.style.backgroundColor=colors[processIndex%colors.length];
+    seg.style.height=(processSizes[processIndex]/blockSizes[blockIndex]*100)+'%';
+    seg.innerText=`P${processIndex+1}\n${processSizes[processIndex]} KB`;
+    blockDiv.appendChild(seg);
+
+    if(internalFrag[blockIndex]>0){
+        const frag=document.createElement('div');
+        frag.className='process-segment';
+        frag.style.backgroundColor='#fce7f3';
+        frag.style.height=(internalFrag[blockIndex]/blockSizes[blockIndex]*100)+'%';
+        frag.innerText=`Frag ${internalFrag[blockIndex]} KB`;
+        blockDiv.appendChild(frag);
+    }
+}
+
+function findBlock(method,size){
+    let bestIndex=-1;
+    if(method==='first'){
+        for(let i=0;i<blockSizes.length;i++)
+            if(!blockOccupied[i] && blockSizes[i]>=size) return i;
+    }else if(method==='best'){
+        let minSpace=Infinity;
+        for(let i=0;i<blockSizes.length;i++){
+            if(!blockOccupied[i] && blockSizes[i]>=size && (blockSizes[i]-size)<minSpace){
+                minSpace=blockSizes[i]-size; bestIndex=i;
+            }
+        }
+        return bestIndex;
+    }else if(method==='worst'){
+        let maxSpace=-1;
+        for(let i=0;i<blockSizes.length;i++){
+            if(!blockOccupied[i] && blockSizes[i]>=size && (blockSizes[i]-size)>maxSpace){
+                maxSpace=blockSizes[i]-size; bestIndex=i;
+            }
+        }
+        return bestIndex;
+    }
+    return -1;
+}
+
+function compactMemory(){
+    let k=0, freeTotal=0;
+    for(let i=0;i<blockSizes.length;i++){
+        if(blockOccupied[i]){
+            blockSizes[k]=blockSizes[i];
+            blockOccupied[k]=true;
+            k++;
+        } else freeTotal+=blockSizes[i];
+    }
+    if(k<blockSizes.length){ blockSizes[k]=freeTotal; blockOccupied[k]=false; k++; }
+    for(let i=k;i<blockSizes.length;i++){ blockSizes[i]=0; blockOccupied[i]=false; }
+    renderBlocks();
+}
+
+function renderBlocks(){
+    const blocksDiv=document.getElementById('blocks');
+    blocksDiv.innerHTML='';
+    for(let i=0;i<blockSizes.length;i++){
+        let div=document.createElement('div'); div.className='memory-block'; div.id='block'+i;
+        div.innerHTML=`<div class="block-title">B${i+1}<br>${blockSizes[i]} KB</div>`;
+        blocksDiv.appendChild(div);
+    }
+    for(let i=0;i<allocation.length;i++){
+        if(allocation[i]!=-1 && allocation[i]!=='Merged') drawProcess(i, allocation[i]);
+    }
+}
+
+async function animateMergedAllocation(){
+    let mergedFree=0;
+    for(let i=0;i<blockSizes.length;i++){
+        if(!blockOccupied[i]) mergedFree+=blockSizes[i];
+        else mergedFree+=internalFrag[i];
+    }
+
+    const mergedBlock=document.createElement('div');
+    mergedBlock.className='memory-block';
+    mergedBlock.id='blockMerged';
+    mergedBlock.innerHTML=`<div class="block-title">Merged Free<br>${mergedFree} KB</div>`;
+    document.getElementById('blocks').appendChild(mergedBlock);
+
+    for(let i=0;i<allocation.length;i++){
+        if(allocation[i]===-1 && mergedFree>=processSizes[i]){
+            await new Promise(res => setTimeout(res, 700));
+            allocation[i]='Merged';
+            const seg=document.createElement('div');
+            seg.className='process-segment';
+            seg.style.backgroundColor=colors[i%colors.length];
+            seg.style.height=(processSizes[i]/mergedFree*100)+'%';
+            seg.innerText=`P${i+1}\n${processSizes[i]} KB`;
+            mergedBlock.appendChild(seg);
+            mergedFree-=processSizes[i];
+            updateFragmentation();
+        }
+    }
+}
+
+function updateFragmentation(){
+    let totalInternal=internalFrag.reduce((a,b)=>a+b,0);
+    let totalExternal=0;
+    for(let i=0;i<blockSizes.length;i++) if(!blockOccupied[i]) totalExternal+=blockSizes[i];
+    document.getElementById('fragReport').innerHTML=`<strong>Fragmentation Report</strong><br>
+        Total Internal: ${totalInternal} KB<br>
+        Total External: ${totalExternal} KB`;
+}
+</script>
+</body>
+</html>
