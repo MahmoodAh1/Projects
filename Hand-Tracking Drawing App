@@ -1,0 +1,177 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import random
+
+
+# Settings
+MAX_FIRE = 200
+MAX_WATER = 500
+CAM_WIDTH, CAM_HEIGHT = 640, 480
+
+# Mediapipe Hands Setup
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(max_num_hands=2,
+                       min_detection_confidence=0.7,
+                       min_tracking_confidence=0.7)
+
+# Camera Setup
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(1)
+cap.set(3, CAM_WIDTH)
+cap.set(4, CAM_HEIGHT)
+
+# Particle Systems
+fire_particles = []
+water_particles = []
+canvas = None
+
+# Keep previous positions for smooth water
+prev_left_pos = None
+
+# Fire Particle
+
+class FireParticle:
+    __slots__ = ['x','y','size','life','speed']
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+        self.size = random.randint(6, 14)
+        self.life = random.randint(15, 25)
+        self.speed = random.uniform(1.5, 3.5)
+    def update(self):
+        self.y -= self.speed
+        self.x += random.uniform(-1.5, 1.5)
+        self.size -= 0.4
+        self.life -= 1
+    def draw(self, canvas_layer):
+        if self.life > 0 and self.size > 0:
+            b = 0
+            g = random.randint(100,220)
+            r = random.randint(180,255)
+            color = (b,g,r)
+            cv2.circle(canvas_layer, (int(self.x), int(self.y)), int(self.size), color, -1)
+
+# Water Particle
+
+class WaterParticle:
+    __slots__ = ['x','y','life','speed','dx']
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+        self.life = random.randint(20, 35)
+        self.speed = random.uniform(0.5, 1.5)
+        self.dx = random.uniform(-0.3, 0.3)
+    def update(self):
+        self.y += self.speed
+        self.x += self.dx
+        self.life -= 1
+    def draw(self, canvas_layer):
+        if self.life > 0:
+            alpha = max(0.2, self.life / 35)
+            b = int(255 * alpha)
+            g = int(150 * alpha)
+            r = 0
+            color = (b,g,r)
+            cv2.circle(canvas_layer, (int(self.x), int(self.y)), 5, color, -1)
+
+# Utility
+def is_drawing(hand_landmarks):
+    return hand_landmarks.landmark[8].y < hand_landmarks.landmark[6].y
+
+# Main Loop
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("Camera not detected!")
+        break
+
+    frame = cv2.flip(frame, 1)
+    h, w, _ = frame.shape
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(rgb)
+
+    if canvas is None:
+        canvas = np.zeros_like(frame)
+
+    # Reset previous left finger position if no hand detected
+    left_pos = None
+
+    # Hand Detection
+
+    if results.multi_hand_landmarks:
+        for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
+            label = results.multi_handedness[idx].classification[0].label
+            x = int(hand_landmarks.landmark[8].x * w)
+            y = int(hand_landmarks.landmark[8].y * h)
+
+            if is_drawing(hand_landmarks):
+                if label == "Right":
+                    for _ in range(4):
+                        if len(fire_particles) < MAX_FIRE:
+                            fire_particles.append(FireParticle(x, y))
+                else:
+                    left_pos = (x, y)
+                    if prev_left_pos is None:
+                        prev_left_pos = left_pos
+                    # Spawn water particles along the line from prev to current
+                    dx = left_pos[0] - prev_left_pos[0]
+                    dy = left_pos[1] - prev_left_pos[1]
+                    steps = max(1, abs(dx), abs(dy))  
+                    for i in range(steps+1):
+                        px = int(prev_left_pos[0] + dx * i / steps)
+                        py = int(prev_left_pos[1] + dy * i / steps)
+                        water_particles.append(WaterParticle(px, py))
+                    if len(water_particles) > MAX_WATER:
+                        water_particles = water_particles[-MAX_WATER:]
+                    prev_left_pos = left_pos
+    else:
+        prev_left_pos = None
+
+
+    # Update & Draw Fire
+    
+    for particle in fire_particles[:]:
+        particle.update()
+        particle.draw(canvas)
+        if particle.life <= 0:
+            fire_particles.remove(particle)
+
+
+    # Update & Draw Water
+
+    for particle in water_particles[:]:
+        particle.update()
+        particle.draw(canvas)
+        if particle.life <= 0:
+            water_particles.remove(particle)
+
+
+    # Glow effect
+
+    blur = cv2.GaussianBlur(canvas, (11,11), 0)
+    effect_layer = cv2.addWeighted(canvas, 1, blur, 0.5, 0)
+
+
+    # Combine with camera
+
+    final = cv2.addWeighted(frame, 0.7, effect_layer, 1, 0)
+    cv2.imshow("🔥 Fire & 💧 Water Magic", final)
+
+
+    # Controls
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+    elif key == ord('c'):
+        canvas = np.zeros_like(frame)
+        fire_particles.clear()
+        water_particles.clear()
+        prev_left_pos = None
+    elif key == ord('k'):
+        pass  # retainer: keep canvas
+
+cap.release()
+cv2.destroyAllWindows()
