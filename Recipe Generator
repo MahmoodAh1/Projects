@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+"""
+RecipeRadar - Flask Backend
+Fully synced to app2.py logic.
+
+HOW TO RUN:
+  1. pip install flask mysql-connector-python
+  2. python flask_app.py
+  3. Open http://127.0.0.1:5000   <-- MUST use this URL, not file://
+
+Both flask_app.py and index.html must be in the SAME folder.
+"""
+
+from flask import Flask, request, jsonify, session, send_from_directory
+import mysql.connector
+from mysql.connector import Error
+import random, re, os
+from collections import defaultdict
+
+app = Flask(__name__, static_folder=None)
+app.secret_key = "reciperadar_secret_2025"
+
+DB_CONFIG = {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "root",
+    "password": "hoorain2005",
+    "database": "recipe_app",
+}
+
+# ── DB helpers ────────────────────────────────────────────────
+def get_conn():
+    return mysql.connector.connect(**DB_CONFIG)
+
+def fetch_all(sql, params=()):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(sql, params); rows = cur.fetchall()
+    cur.close(); conn.close(); return rows
+
+def fetch_one(sql, params=()):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(sql, params); row = cur.fetchone()
+    cur.close(); conn.close(); return row
+
+def execute(sql, params=()):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(sql, params); conn.commit()
+    lid = cur.lastrowid; cur.close(); conn.close(); return lid
+
+# ── Utilities ─────────────────────────────────────────────────
+def trim(s): return (s or "").strip()
+def to_lower(s): return (s or "").strip().lower()
+
+def normalize_to_canonical(raw):
+    x = to_lower(trim(raw))
+    if not x: return ""
+    row = fetch_one("SELECT canonical_name FROM ingredient_aliases WHERE alias_lc=%s", (x,))
+    if row: return row[0]
+    row = fetch_one("SELECT canonical_name FROM ingredient_catalog WHERE canonical_lc=%s", (x,))
+    if row: return row[0]
+    execute("INSERT IGNORE INTO ingredient_catalog(canonical_name,category) VALUES(%s,'Other')", (x,))
+    row = fetch_one("SELECT canonical_name FROM ingredient_catalog WHERE canonical_lc=%s", (x,))
+    return row[0] if row else x
+
+def ingredient_matches(user_ing, db_ing):
+    db_clean = re.sub(r'^[\s\d./,]+', '', db_ing).strip()
+    return bool(re.search(r'\b' + re.escape(user_ing) + r'\b', db_clean))
+
+def word_match(user_ing, db_ing):
+    return bool(re.search(r'\b' + re.escape(user_ing) + r'\b', db_ing.lower()))
+
+def convert_to_grams(amount, unit):
+    if not amount or float(amount) <= 0: return None
+    u = to_lower(unit)
+    if u in ("g","gram","grams"): return float(amount)
+    if u in ("kg","kilogram","kilograms"): return float(amount) * 1000
+    if u in ("mg","milligram","milligrams"): return float(amount) / 1000
+    return None
+
+def load_recipe_full(recipe_id):
+    row = fetch_one("""
+        SELECT r.id, r.cuisine_id, c.name, r.name,
+               COALESCE(r.instructions,''), r.servings, COALESCE(r.meal_type,'')
+        FROM recipes r JOIN cuisines c ON c.id=r.cuisine_id
+        WHERE r.id=%s
+    """, (recipe_id,))
+    if not row: return None
+    rid, cid, cuisine, name, instructions, servings, meal_type = row
+
+    ing_rows = fetch_all("""
+        SELECT i.name,
+               COALESCE(ia.canonical_name, ic2.canonical_name, i.name),
+               COALESCE(ic.category,'Other'),
+               COALESCE(i.amount,0), COALESCE(i.unit,''),
+               COALESCE(i.quantity_text,''), i.importance
+        FROM ingredients i
+        LEFT JOIN ingredient_aliases ia ON ia.alias_lc=i.name_lc
+        LEFT JOIN ingredient_catalog ic2 ON ic2.canonical_lc=i.name_lc
+        LEFT JOIN ingredient_catalog ic ON ic.canonical_name=COALESCE(ia.canonical_name,ic2.canonical_name,i.name)
+        WHERE i.recipe_id=%s ORDER BY i.id
+    """, (rid,))
+
+    ingredients = []
+    for r in ing_rows:
+        dn, cn, cat, amt, unit, qty_txt, imp = r
+        amt = float(amt or 0)
+        if qty_txt: qty_display = qty_txt
+        elif amt > 0 and unit: qty_display = f"{amt:g} {unit}"
+        else: qty_display = "(qty not set)"
+        ingredients.append({"display_name":dn,"canonical_name":cn,"category":cat,
+                             "amount":amt,"unit":unit,"quantity_text":qty_txt,
+                             "qty_display":qty_display,"importance":int(imp)})
+
+    return {"id":int(rid),"cuisine_id":int(cid),"cuisine":cuisine,"name":name,
+            "instructions":instructions,"servings":int(servings),
+            "meal_type":meal_type,"ingredients":ingredients}
+
+def find_best_match_recipe_id(cuisine_name, user_lc_list):
+    if not cuisine_name or not user_lc_list: return -1
+    rows = fetch_all("""
+        SELECT r.id,
+               LOWER(COALESCE(ia.canonical_name,ic2.canonical_name,i.name)) AS ing_name
+        FROM recipes r
+        JOIN cuisines c ON c.id=r.cuisine_id
+        JOIN ingredients i ON i.recipe_id=r.id
+        LEFT JOIN ingredient_aliases ia ON ia.alias_lc=i.name_lc
+        LEFT JOIN ingredient_catalog ic2 ON ic2.canonical_lc=i.name_lc
+        WHERE c.name=%s
+    """, (cuisine_name,))
+    if not rows: return -1
+
+    recipe_ings = defaultdict(set)
+    for rid, ing in rows:
+        recipe_ings[int(rid)].add(ing)
+
+    def score(threshold):
+        res = []
+        for rid, ings in recipe_ings.items():
+            matched = sum(1 for ui in user_lc_list if any(ingredient_matches(ui, di) for di in ings))
+            if matched >= threshold: res.append((rid, matched))
+        return res
+
+    best = score(3) or score(2)
+    if not best: return -1
+    best.sort(key=lambda x: x[1], reverse=True)
+    return random.choice(best[:5])[0]
+
+def compute_nutrition(recipe, servings_wanted):
+    scale = servings_wanted / max(1, recipe["servings"])
+    cal=prot=carb=fat=0.0; any_ok=False; skipped=[]
+    for ing in recipe["ingredients"]:
+        g = convert_to_grams(ing["amount"] * scale, ing["unit"])
+        if g is None: skipped.append(ing["display_name"]); continue
+        row = fetch_one("""SELECT calories_per_100,protein_per_100,carbs_per_100,fat_per_100
+                           FROM ingredient_nutrition WHERE canonical_name=%s""", (ing["canonical_name"],))
+        if not row: skipped.append(f"{ing['display_name']} (no data)"); continue
+        f = g / 100
+        cal+=float(row[0])*f; prot+=float(row[1])*f
+        carb+=float(row[2])*f; fat+=float(row[3])*f; any_ok=True
+    return {"calories":round(cal,1),"protein":round(prot,1),"carbs":round(carb,1),
+            "fat":round(fat,1),"any_computed":any_ok,"skipped":skipped}
+
+def get_random_dessert(cuisine_name=None):
+    pattern = r'cake|pie|tart|ice cream|cookie|brownie|pudding|dessert|custard|sorbet|gelato|torte|bar'
+    if cuisine_name:
+        row = fetch_one("""SELECT r.id FROM recipes r JOIN cuisines c ON c.id=r.cuisine_id
+                           WHERE c.name=%s AND (r.meal_type='Snack' OR LOWER(r.name) REGEXP %s)
+                           ORDER BY RAND() LIMIT 1""", (cuisine_name, pattern))
+    else:
+        row = fetch_one("""SELECT r.id FROM recipes r
+                           WHERE r.meal_type='Snack' OR LOWER(r.name) REGEXP %s
+                           ORDER BY RAND() LIMIT 1""", (pattern,))
+    return int(row[0]) if row else None
+
+# ── Serve frontend ─────────────────────────────────────────────
+@app.route("/")
+def serve_home():
+    # Get the folder where flask_app.py is located
+    folder = os.path.dirname(os.path.abspath(__file__))
+    # Make sure this filename matches your actual file exactly!
+    return send_from_directory(folder, "index (1).html")
+
+# ── Auth ───────────────────────────────────────────────────────
+@app.route("/api/login", methods=["POST"])
+def login():
+    data = request.get_json(force=True) or {}
+    username = trim(data.get("username", ""))
+    if not username:
+        return jsonify({"error": "Username cannot be empty"}), 400
+    try:
+        execute("INSERT IGNORE INTO users(username) VALUES(%s)", (username,))
+        row = fetch_one("SELECT id, username FROM users WHERE username=%s", (username,))
+        if not row: return jsonify({"error": "Failed to create user"}), 500
+        session["user_id"] = int(row[0]); session["username"] = row[1]
+        return jsonify({"user_id": int(row[0]), "username": row[1]})
+    except Error as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/logout", methods=["POST"])
+def logout():
+    session.clear(); return jsonify({"ok": True})
+
+# ── Cuisines ───────────────────────────────────────────────────
+@app.route("/api/cuisines")
+def cuisines():
+    rows = fetch_all("SELECT name FROM cuisines ORDER BY name")
+    return jsonify([r[0] for r in rows])
+
+# ── Search ─────────────────────────────────────────────────────
+@app.route("/api/recipes/search")
+def search_recipes():
+    q=trim(request.args.get("q","")); cuisine=trim(request.args.get("cuisine",""))
+    meal=trim(request.args.get("meal_type","")); page=max(1,int(request.args.get("page",1)))
+    per_page=20; offset=(page-1)*per_page
+    where="WHERE 1=1"; params=[]
+    if q: where+=" AND r.name LIKE %s"; params.append(f"%{q}%")
+    if cuisine: where+=" AND c.name=%s"; params.append(cuisine)
+    if meal: where+=" AND r.meal_type=%s"; params.append(meal)
+    total_row=fetch_one(f"SELECT COUNT(*) FROM recipes r JOIN cuisines c ON c.id=r.cuisine_id {where}",tuple(params))
+    total=int(total_row[0]) if total_row else 0
+    rows=fetch_all(f"""SELECT r.id,r.name,c.name,COALESCE(r.meal_type,''),r.servings
+        FROM recipes r JOIN cuisines c ON c.id=r.cuisine_id
+        {where} ORDER BY r.name LIMIT %s OFFSET %s""", tuple(params)+(per_page,offset))
+    return jsonify({"results":[{"id":r[0],"name":r[1],"cuisine":r[2],"meal_type":r[3],"servings":r[4]} for r in rows],
+                    "total":total,"page":page,"per_page":per_page,
+                    "pages":max(1,(total+per_page-1)//per_page)})
+
+# ── Recipe detail ──────────────────────────────────────────────
+@app.route("/api/recipes/<int:recipe_id>")
+def recipe_detail(recipe_id):
+    recipe=load_recipe_full(recipe_id)
+    if not recipe: return jsonify({"error":"Not found"}),404
+    user_id=session.get("user_id")
+    recipe["is_favorite"]=False; recipe["my_rating"]=0
+    if user_id:
+        fav=fetch_one("SELECT 1 FROM favorites WHERE user_id=%s AND recipe_id=%s",(user_id,recipe_id))
+        recipe["is_favorite"]=bool(fav)
+        rat=fetch_one("SELECT rating FROM ratings WHERE user_id=%s AND recipe_id=%s",(user_id,recipe_id))
+        recipe["my_rating"]=int(rat[0]) if rat else 0
+        execute("INSERT INTO history(user_id,recipe_id) VALUES(%s,%s)",(user_id,recipe_id))
+    return jsonify(recipe)
+
+# ── Daily plan ─────────────────────────────────────────────────
+@app.route("/api/daily-plan")
+def daily_plan():
+    cuisine = trim(request.args.get("cuisine", ""))
+    dessert_cuisine = trim(request.args.get("dessert_cuisine", "")) or None
+    include_dessert = request.args.get("include_dessert", "false").lower() == "true"
+
+    # If no cuisine specified, pick random
+    if not cuisine:
+        row = fetch_one("SELECT DISTINCT c.name FROM cuisines c JOIN recipes r ON r.cuisine_id = c.id ORDER BY RAND() LIMIT 1")
+        cuisine = row[0] if row else "Italian"
+
+    plan = {"cuisine": cuisine}
+    user_id = session.get("user_id")
+
+    for mt in ("Breakfast", "Lunch", "Dinner"):
+        row = fetch_one("""SELECT r.id, r.name FROM recipes r JOIN cuisines c ON c.id=r.cuisine_id
+            WHERE c.name=%s AND r.meal_type=%s ORDER BY RAND() LIMIT 1""", (cuisine, mt))
+        meal_data = {"id": int(row[0]), "name": row[1]} if row else {"id": None, "name": "(none found)"}
+        plan[mt] = meal_data
+        # Record history
+        if user_id and meal_data["id"]:
+            execute("INSERT INTO history(user_id,recipe_id) VALUES(%s,%s)", (user_id, meal_data["id"]))
+
+    # Dessert: only include when explicitly requested
+    if include_dessert:
+        did = get_random_dessert(dessert_cuisine)
+        if did:
+            dr = load_recipe_full(did)
+            plan["Dessert"] = {"id": did, "name": dr["name"], "cuisine": dr["cuisine"]}
+            if user_id:
+                execute("INSERT INTO history(user_id,recipe_id) VALUES(%s,%s)", (user_id, did))
+        else:
+            plan["Dessert"] = {"id": None, "name": "(none found)", "cuisine": ""}
+    else:
+        plan["Dessert"] = None
+
+    return jsonify(plan)
+
+# ── Weekly plan ────────────────────────────────────────────────
+@app.route("/api/weekly-plan")
+def weekly_plan():
+    cuisine = trim(request.args.get("cuisine", ""))
+    mode = request.args.get("mode", "specific")
+    days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+    all_c = [r[0] for r in fetch_all("SELECT DISTINCT c.name FROM cuisines c JOIN recipes r ON r.cuisine_id = c.id ORDER BY c.name")]
+    plan = {}
+    user_id = session.get("user_id")
+
+    for day in days:
+        dc = random.choice(all_c) if (mode == "random" or not cuisine) and all_c else cuisine
+        day_plan = {"cuisine": dc}
+        for mt in ("Breakfast", "Lunch", "Dinner"):
+            row = fetch_one("""SELECT r.id,r.name FROM recipes r JOIN cuisines c ON c.id=r.cuisine_id
+                WHERE c.name=%s AND r.meal_type=%s ORDER BY RAND() LIMIT 1""", (dc, mt))
+            meal_data = {"id": int(row[0]), "name": row[1]} if row else {"id": None, "name": "(none found)"}
+            day_plan[mt] = meal_data
+            if user_id and meal_data["id"]:
+                execute("INSERT INTO history(user_id,recipe_id) VALUES(%s,%s)", (user_id, meal_data["id"]))
+        plan[day] = day_plan
+
+    return jsonify(plan)
+
+# ── Weekly dessert ─────────────────────────────────────────────
+@app.route("/api/weekly-dessert")
+def weekly_dessert():
+    """Fetch a dessert for the weekly plan (separate endpoint so it's optional)."""
+    dessert_cuisine = trim(request.args.get("dessert_cuisine", "")) or None
+    did = get_random_dessert(dessert_cuisine)
+    if did:
+        dr = load_recipe_full(did)
+        user_id = session.get("user_id")
+        if user_id:
+            execute("INSERT INTO history(user_id,recipe_id) VALUES(%s,%s)", (user_id, did))
+        return jsonify({"id": did, "name": dr["name"], "cuisine": dr["cuisine"]})
+    return jsonify({"id": None, "name": "(none found)", "cuisine": ""})
+
+# ── Ingredient match ───────────────────────────────────────────
+@app.route("/api/match-ingredients", methods=["POST"])
+def match_ingredients():
+    data = request.get_json(force=True) or {}
+    raw_ings = data.get("ingredients", [])
+    cuisine = trim(data.get("cuisine", ""))
+    user_id = session.get("user_id")
+
+    if len(raw_ings) < 2: return jsonify({"error": "Please add at least 2 ingredients"}), 400
+    if not cuisine: return jsonify({"error": "Please select a cuisine"}), 400
+
+    typed_lc = {to_lower(normalize_to_canonical(r)) for r in raw_ings}
+    pantry_lc = set()
+    if user_id:
+        rows = fetch_all("SELECT LOWER(canonical_name) FROM pantry_items WHERE user_id=%s", (user_id,))
+        pantry_lc = {r[0] for r in rows}
+    have_lc = pantry_lc | typed_lc
+    have_list = sorted(have_lc)
+
+    best_id = find_best_match_recipe_id(cuisine, have_list)
+    if best_id == -1:
+        return jsonify({"error": f"No match found in '{cuisine}'. Try more ingredients or a different cuisine."}), 404
+
+    recipe = load_recipe_full(best_id)
+    if not recipe: return jsonify({"error": "Recipe not found"}), 404
+    if user_id: execute("INSERT INTO history(user_id,recipe_id) VALUES(%s,%s)", (user_id, best_id))
+
+    recipe_canonicals = [to_lower(i["canonical_name"]) for i in recipe["ingredients"]]
+    provided = []
+    for db_ing in recipe_canonicals:
+        for ui in have_lc:
+            if word_match(ui, db_ing): provided.append(db_ing); break
+
+    missing_ings = [i for i in recipe["ingredients"]
+                    if not any(word_match(u, to_lower(i["canonical_name"])) for u in have_lc)]
+
+    recipe["provided"] = provided
+    recipe["missing"] = [{"display_name": i["display_name"], "qty_display": i["qty_display"]}
+                         for i in missing_ings]
+    recipe["match_count"] = len(provided)
+    recipe["total_ing"] = len(recipe["ingredients"])
+    # Pass typed ingredients back so the frontend can use them for shopping list
+    recipe["typed_ingredients"] = list(typed_lc)
+    recipe["have_lc"] = list(have_lc)
+
+    return jsonify(recipe)
+
+# ── Pantry ─────────────────────────────────────────────────────
+@app.route("/api/pantry", methods=["GET"])
+def get_pantry():
+    user_id = session.get("user_id")
+    if not user_id: return jsonify([])
+    rows = fetch_all("""SELECT p.canonical_name,COALESCE(ic.category,'Other')
+        FROM pantry_items p LEFT JOIN ingredient_catalog ic ON ic.canonical_name=p.canonical_name
+        WHERE p.user_id=%s ORDER BY COALESCE(ic.category,'Other'),p.canonical_name""", (user_id,))
+    return jsonify([{"name": r[0], "category": r[1]} for r in rows])
+
+@app.route("/api/pantry", methods=["POST"])
+def add_pantry():
+    user_id = session.get("user_id")
+    if not user_id: return jsonify({"error": "Not logged in"}), 401
+    raw = trim((request.get_json(force=True) or {}).get("name", ""))
+    if not raw: return jsonify({"error": "Name required"}), 400
+    canonical = normalize_to_canonical(raw)
+    execute("INSERT IGNORE INTO pantry_items(user_id,canonical_name) VALUES(%s,%s)", (user_id, canonical))
+    return jsonify({"ok": True, "canonical": canonical})
+
+@app.route("/api/pantry/<path:name>", methods=["DELETE"])
+def remove_pantry(name):
+    user_id = session.get("user_id")
+    if not user_id: return jsonify({"error": "Not logged in"}), 401
+    execute("DELETE FROM pantry_items WHERE user_id=%s AND canonical_name=%s", (user_id, name))
+    return jsonify({"ok": True})
+
+# ── Favorites ──────────────────────────────────────────────────
+@app.route("/api/favorites", methods=["GET"])
+def get_favorites():
+    user_id = session.get("user_id")
+    if not user_id: return jsonify([])
+    rows = fetch_all("""SELECT r.id,r.name,c.name,COALESCE(r.meal_type,''),COALESCE(ra.rating,0)
+        FROM favorites f JOIN recipes r ON r.id=f.recipe_id JOIN cuisines c ON c.id=r.cuisine_id
+        LEFT JOIN ratings ra ON ra.recipe_id=r.id AND ra.user_id=f.user_id
+        WHERE f.user_id=%s ORDER BY r.name""", (user_id,))
+    return jsonify([{"id": r[0], "name": r[1], "cuisine": r[2], "meal_type": r[3], "rating": int(r[4])} for r in rows])
+
+@app.route("/api/favorites/<int:recipe_id>", methods=["POST"])
+def toggle_favorite(recipe_id):
+    user_id = session.get("user_id")
+    if not user_id: return jsonify({"error": "Not logged in"}), 401
+    ex = fetch_one("SELECT 1 FROM favorites WHERE user_id=%s AND recipe_id=%s", (user_id, recipe_id))
+    if ex:
+        execute("DELETE FROM favorites WHERE user_id=%s AND recipe_id=%s", (user_id, recipe_id))
+        return jsonify({"favorited": False})
+    execute("INSERT IGNORE INTO favorites(user_id,recipe_id) VALUES(%s,%s)", (user_id, recipe_id))
+    return jsonify({"favorited": True})
+
+# ── Ratings ────────────────────────────────────────────────────
+@app.route("/api/rate/<int:recipe_id>", methods=["POST"])
+def rate_recipe(recipe_id):
+    user_id = session.get("user_id")
+    if not user_id: return jsonify({"error": "Not logged in"}), 401
+    rating = int((request.get_json(force=True) or {}).get("rating", 0))
+    if not 1 <= rating <= 5: return jsonify({"error": "Rating must be 1-5"}), 400
+    execute("""INSERT INTO ratings(user_id,recipe_id,rating) VALUES(%s,%s,%s)
+               ON DUPLICATE KEY UPDATE rating=VALUES(rating)""", (user_id, recipe_id, rating))
+    return jsonify({"ok": True})
+
+# ── Shopping list ──────────────────────────────────────────────
+@app.route("/api/shopping-list/<int:recipe_id>")
+def shopping_list(recipe_id):
+    user_id = session.get("user_id")
+    pantry_lc = set()
+    if user_id:
+        rows = fetch_all("SELECT LOWER(canonical_name) FROM pantry_items WHERE user_id=%s", (user_id,))
+        pantry_lc = {r[0] for r in rows}
+
+    # Accept additional typed ingredients via query param (from ingredient match flow)
+    extra_have = request.args.get("have_lc", "")
+    if extra_have:
+        for item in extra_have.split(","):
+            item = item.strip()
+            if item:
+                pantry_lc.add(item)
+
+    recipe = load_recipe_full(recipe_id)
+    if not recipe: return jsonify({"error": "Not found"}), 404
+
+    by_cat = {}; have = []
+    for ing in recipe["ingredients"]:
+        if to_lower(ing["canonical_name"]) in pantry_lc:
+            have.append({"display_name": ing["display_name"], "qty_display": ing["qty_display"]})
+        else:
+            cat = ing["category"] or "Other"
+            by_cat.setdefault(cat, []).append({"display_name": ing["display_name"], "qty_display": ing["qty_display"]})
+
+    return jsonify({"need_grouped": {c: v for c, v in sorted(by_cat.items())}, "have": have})
+
+# ── Nutrition ──────────────────────────────────────────────────
+@app.route("/api/nutrition/<int:recipe_id>")
+def nutrition(recipe_id):
+    servings = max(1, int(request.args.get("servings", 1)))
+    recipe = load_recipe_full(recipe_id)
+    if not recipe: return jsonify({"error": "Not found"}), 404
+    result = compute_nutrition(recipe, servings)
+    result["servings"] = servings
+    result["recipe_name"] = recipe["name"]
+    return jsonify(result)
+
+# ── Budget estimate ────────────────────────────────────────────
+@app.route("/api/budget/<int:recipe_id>")
+def budget_estimate(recipe_id):
+    """
+    Mirrors app2.py budget_estimate():
+    Compares missing ingredients against ingredient_prices for a given store,
+    sums unit prices, and lists items with no price data.
+    """
+    store = trim(request.args.get("store", ""))
+    if not store:
+        return jsonify({"error": "Store name is required"}), 400
+
+    user_id = session.get("user_id")
+    # Build have_lc from pantry + any extra passed ingredients
+    pantry_lc = set()
+    if user_id:
+        rows = fetch_all("SELECT LOWER(canonical_name) FROM pantry_items WHERE user_id=%s", (user_id,))
+        pantry_lc = {r[0] for r in rows}
+
+    extra_have = request.args.get("have_lc", "")
+    if extra_have:
+        for item in extra_have.split(","):
+            item = item.strip()
+            if item:
+                pantry_lc.add(item)
+
+    recipe = load_recipe_full(recipe_id)
+    if not recipe: return jsonify({"error": "Recipe not found"}), 404
+
+    total = 0.0
+    no_price = []
+    items_priced = []
+
+    for ing in recipe["ingredients"]:
+        if to_lower(ing["canonical_name"]) in pantry_lc:
+            continue  # user already has this ingredient
+        price_row = fetch_one(
+            "SELECT price, unit FROM ingredient_prices WHERE store=%s AND canonical_name=%s",
+            (store, ing["canonical_name"])
+        )
+        if price_row:
+            price = float(price_row[0])
+            unit = price_row[1]
+            total += price
+            items_priced.append({
+                "display_name": ing["display_name"],
+                "price": round(price, 2),
+                "unit": unit
+            })
+        else:
+            no_price.append(ing["canonical_name"])
+
+    return jsonify({
+        "store": store,
+        "recipe_name": recipe["name"],
+        "total": round(total, 2),
+        "items_priced": items_priced,
+        "no_price_data": sorted(set(no_price))
+    })
+
+# @app.route("/<path:path>")
+# def static_proxy(path):
+#     # This ensures any other files (images/css) are also found
+#     return send_from_directory('.', path)
+
+# ── Run ────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("\n" + "="*50)
+    print("  RecipeRadar is running!")
+    print("  Open this in your browser:")
+    print("  --> http://127.0.0.1:5000 <--")
+    print("  (Do NOT open index.html directly)")
+    print("="*50 + "\n")
+    app.run(debug=True, port=5000, host="127.0.0.1")
